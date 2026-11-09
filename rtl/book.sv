@@ -93,10 +93,75 @@ module book
         // Consider all LEVELS levels together, in parallel, not one at a
         // time: for each level, what determines its *new* value from the
         // *old* values of its neighbors?
-        update_result_t result;
+        update_result_t    result;
+        logic [LEVELS-1:0] is_better;   // level i is valid and better than the update's price
+        logic [LEVELS-1:0] is_match;    // level i is valid and at the update's price
+        logic [LEVELS-1:0] is_emptied;  // level i is the match, and the update removes all of it
+        logic [LEVELS-1:0] is_new;      // level i is where a new level goes
+        logic              found;       // the update's price is in the book
+        logic              emptied;     // the update removes its whole level
+        side_t             moved_up;    // moved_up[i]   = levels[i+1]; the last place empty
+        side_t             moved_down;  // moved_down[i] = levels[i-1]; the first place empty
+        level_t            new_level;
+
+        // Every level compares itself with the update at once. The list is
+        // sorted, so is_better is a run of ones followed by zeros: the levels
+        // that stay put.
+        for (int i = 0; i < LEVELS; ++i) begin
+            is_better[i]  = levels[i].valid && better(update.is_buy, levels[i].price, update.price);
+            is_match[i]   = levels[i].valid && levels[i].price == update.price;
+            is_emptied[i] = is_match[i] && update.shares >= levels[i].size;
+        end
+        found   = |is_match;
+        emptied = !update.add && |is_emptied;
+
+        // A new level goes at the first level that isn't better than it: the
+        // place whose upper neighbor is better, or the top.
+        is_new = ~is_better & {is_better[LEVELS-2:0], 1'b1};
+
+        // Each level's neighbors, as whole shifted copies of the side.
+        moved_up   = levels >> $bits(level_t);
+        moved_down = levels << $bits(level_t);
+
+        new_level.valid = 1'b1;
+        new_level.price = update.price;
+        new_level.size  = update.shares;
+
         result.levels   = levels;
         result.overflow = 1'b0;
+        if (!update.valid) begin
+            // Nothing to do.
+        end else if (found && !emptied) begin
+            // A size change at an existing level; nothing moves.
+            for (int i = 0; i < LEVELS; ++i) begin
+                if (is_match[i]) begin
+                    result.levels[i].size = update.add ? levels[i].size + update.shares
+                                                       : levels[i].size - update.shares;
+                end
+            end
+        end else if (found) begin
+            // The level empties: it and every worse level take the next one's
+            // value, and the last place becomes empty.
+            for (int i = 0; i < LEVELS; ++i) begin
+                if (!is_better[i]) result.levels[i] = moved_up[i];
+            end
+        end else if (update.add) begin
+            // Insert: the new level at its place, every worse level moves down.
+            // A full side loses its worst level, or can't store a worse one.
+            for (int i = 0; i < LEVELS; ++i) begin
+                if (is_new[i]) begin
+                    result.levels[i] = new_level;
+                end else if (!is_better[i]) begin
+                    result.levels[i] = moved_down[i];
+                end
+            end
+            result.overflow = levels[LEVELS-1].valid;
+        end else begin
+            // Shares leaving a level we don't track: only after an overflow.
+            result.overflow = 1'b1;
+        end
         return result;
+
     endfunction
 
     // ---------------------------------------------------------------------

@@ -7,7 +7,8 @@
 1. [Market data parser](#1-market-data-parser)
 2. [Sequence check](#2-sequence-check)
 3. [Order encoder](#3-order-encoder)
-4. Book (to do)
+4. [Book](#4-book)
+5. [The whole pipeline: results](#5-the-whole-pipeline-results)
 
 How each module was written: the spec and tests were explained first, the logic predicted, then the code was pasted in by hand and the unit tests run.
 
@@ -209,3 +210,141 @@ Writing a field is the mirror of reading one: `order_data_next[8*o +: 8*n] = val
 3. What does a cancel with shares = 0 mean, and why does halting use it? *(Reduce the order to 0 shares, i.e. cancel it entirely. The quote manager's cancel-all builds exactly this.)*
 4. Why must the bytes after the message be zero?
 5. What happens if the quote manager sends kind = 3?
+
+---
+
+## 4. Book
+
+**File:** [rtl/book.sv](../rtl/book.sv), function `apply_update` (the rest of the module was given) · **Tests:** 4/15 → **15/15 pass**, with no Verilator warnings under `-Wall` (2026-11-09). The 4 that passed before did so trivially: an empty book that never changes is enough for them.
+
+### What was given, what we wrote
+
+| Part | Status |
+|---|---|
+| The registers (`bids`, `asks`, sticky `overflow_seen`, second-cycle state) | Given |
+| Update 0 in the item's first cycle, update 1 in its second | Given |
+| Choosing the bid or ask side; output top of book, `book_overflow`, `book_invalid` | Given |
+| **`apply_update(levels, update)`**: one level update applied to one side | **Ours** |
+
+### How a side is stored
+
+16 slots of `{valid, price, size}`, **best first** (bids highest first, asks lowest first). Valid levels are packed at the top, empty slots at the bottom. The top of book is slot 0, which is wires straight to the output, so reading it is free.
+
+### The cases
+
+| Update | Case | Result | Overflow? |
+|---|---|---|---|
+| Price exists, add | Size change | That slot's size + shares | no |
+| Price exists, remove less than its size | Size change | That slot's size − shares | no |
+| Price exists, remove ≥ its size | Delete | Every worse slot moves up one; the last becomes empty | no |
+| New price, add | Insert | New level at its sorted place; every worse slot moves down one | **yes, if slot 15 was valid**: the worst falls off, or a worse-than-all price can't be stored |
+| New price, remove | Untracked level | Nothing changes | **yes**: can only happen after an earlier overflow |
+| `valid` = 0 | No update | Nothing changes | no |
+
+### How the code works: all 16 slots at once
+
+**1. Masks:** one bit per slot, all computed in parallel.
+
+| Mask | Bit i is 1 when |
+|---|---|
+| `is_better` | slot i is valid and better than the update's price |
+| `is_match` | slot i is valid and at exactly the update's price |
+| `is_emptied` | slot i matches, and the update removes ≥ its size |
+| `is_new` | slot i isn't better, but the slot above it is (or it's slot 0) |
+
+Because the list is sorted, `is_better` is always a run of 1s followed by 0s. That makes `is_new` one line: `~is_better & {is_better[LEVELS-2:0], 1'b1}`.
+
+```
+insert 100.01 into bids [100.02, 100.00, 99.98, empty …]
+
+is_better                     1 0 0 0 …
+shifted down, top filled      1 1 0 0 …
+AND NOT is_better        →    0 1 0 0 …   → the new level goes in slot 1
+```
+
+**2. Neighbours:** `moved_up` and `moved_down` are the whole side shifted by one level's width. So `moved_up[i]` is slot i + 1 and `moved_down[i]` is slot i − 1, with an empty level shifted in at the end.
+
+**3. One branch per case.** Each slot picks its new value from itself, a neighbour, or the new level:
+
+| Branch | Slots with `is_better` | `is_new` slot | Other slots |
+|---|---|---|---|
+| Size change | unchanged | — | matching slot: size ± shares |
+| Delete | unchanged | — | `moved_up` |
+| Insert | unchanged | new level | `moved_down` |
+
+### Decision cards
+
+**All 16 slots in parallel, not a find-then-shift loop**
+- *What:* every slot compares itself with the update at the same time. Each new value is chosen from a couple of mask bits and the neighbours.
+- *Why:* a loop is a **chain**. Each step waits for the one before, so the path from register to register grows with the number of levels, and the clock must slow down. In parallel, the longest path is one 32-bit comparison, a 16-bit OR, and a small choice per slot, whatever the number of levels.
+- *Trade-off:* area. 16 comparators and 16 adders instead of 1 each. The FPGA has plenty of LUTs; time per cycle is the scarce resource.
+- *Evidence:* to measure in Phase 4 (book fmax), and optionally in Phase 5b (a loop version on an experiment branch).
+
+**Each slot has its own adder for size changes**
+- *What:* `levels[i].size ± update.shares` for each slot; only the matching slot uses its result.
+- *Why:* a single shared adder would first need a 16-way choice ("which slot matched?"), then the add, then a write back. That's a longer path. 16 small adders side by side keep the path short.
+- *Trade-off:* about 16 × 32-bit adders' worth of LUTs.
+
+**Neighbours as shifted copies, not `levels[i+1]`**
+- *Why:* for slot 15, `levels[i+1]` would point at slot 16, which doesn't exist. Even in a branch that never runs, Verilator's strict mode may flag the out-of-range index. A shift fills in an empty level at the end automatically. It's the same hardware: wires, no logic.
+
+**16 levels, and halt on overflow instead of refilling**
+- *Why 16:* every level adds a comparator, an adder and a choice to every update, and about 65 flip-flops. More levels means more area and a longer OR across the matches, so a slower clock. 16 is enough to follow the top of a normal book.
+- *Why halt:* once a level has been dropped, the book can't be trusted. When the better levels empty, the dropped level should become visible, and the book doesn't know it. So `book_overflow` is sticky and the quote manager halts.
+- *Alternative:* back the 16 registers with a full-depth store, and refill from it (the module's own comment: "Real systems back a cache like this with a full-depth store"). Rejected here as out of scope: it needs a second structure and a refill path.
+- *Note:* inserting a **better** price into a full side also overflows. The worst level is pushed out, and later it might need to come back.
+
+**One update per cycle, so a replace takes two cycles**
+- *Why:* applying two updates in one cycle would chain a second compare-and-shift after the first, making the path roughly twice as long. Taking 2 cycles per item keeps one compare-and-shift per cycle.
+- *Cost:* the pipeline accepts one item every **2** cycles (II = 2), which the merge enforces. Throughput, not latency, is what's given up.
+- *Evidence:* the design doc says "several times larger and slower". Measuring it is optional experiment 5b.
+
+**Removing ≥ the level's size deletes it**
+- *Why:* "≥" rather than "=" means a level never wraps around to a huge size by subtracting too much. The order table already caps what it removes at an order's remaining shares, so in practice it's "=".
+
+**`book_invalid` is per item, `book_overflow` is sticky**
+- *Why:* an empty side or a crossed book is a real market state that the next message can fix, so we just skip quoting for that item. A dropped level can never be recovered, so it's for good.
+
+### Compared with the C++ book (Assignment 1), for write-up question 2
+
+| | C++ (`app/market_data/book.cpp`, Assignment 1) | FPGA (`book.sv` + `order_table.sv`) |
+|---|---|---|
+| Depth | Every price: one ladder slot per tick, up to $2,000 | Best 16 levels per side |
+| Finding a level | Index the ladder by price ÷ tick: one memory access | Compare against all 16 at once |
+| New best after the top empties | Scan the ladder from the old best until a non-empty tick: a loop of varying length | Everything moves up one slot, in the same cycle: fixed time |
+| Order lookup by ref | A flat array of 2²⁰ entries, ref = index, no collisions | 4,096-entry block RAM, direct-mapped by ref mod 4,096, with tags; a collision halts |
+| When it runs out | Throws if a price or ref is out of range | Sticky overflow / unknown order, and halt |
+| Time per update | Varies (cache misses, the scan) | Always 1 cycle per update, 2 per item |
+| Strength it plays to | Big, cheap memory; flexible loops and branches | Parallel comparison; fixed, predictable timing; registers next to the logic |
+
+### Likely questions
+
+1. Walk me through inserting a new best bid into a full side.
+2. Why compare against all 16 levels at once? What would a loop cost?
+3. Why only 16 levels? What happens on a 17th, and why not refill?
+4. Why does a replace take two cycles, and what does that cost the pipeline?
+5. What's `is_better`, and why is it always 1s then 0s?
+6. Removing shares at a price that isn't in the book: when could that happen?
+7. How does your book differ from your Assignment 1 C++ book, and why is each right for its platform?
+
+---
+
+## 5. The whole pipeline: results
+
+**2026-11-09, after all four modules (the commit that will be tagged `baseline`):**
+
+| Check | Phase 0 (starter) | Now |
+|---|---|---|
+| `make test-holes` | 4/33 (all trivial) | **33/33** |
+| `make verify` | 0/10 | **10/10**: every order identical to the expected files |
+| `build/market_maker sim/fixtures/basic.scn` | 0 orders | **14 orders**, 2,989 cycles simulated |
+
+**Latency on `basic`** (printed by `build/market_maker`, in clock cycles): **min 8, median 9, p99 10, max 10.**
+
+| Number | Order | Why |
+|---|---|---|
+| 8 | First order caused by an execution report | Reports skip the sequence check: 9 register stages |
+| 9 | First order caused by market data | 10 register stages; `Fpga` counts the input's cycle as cycle 0 |
+| 10 | The second order of a pair (usually the ask) | The encoder takes one request per cycle |
+
+This matches the design doc's 9 and 8, and the stage count in [notes/01](01-project-overview.md). The cycle-by-cycle waveform view is Phase 3.
