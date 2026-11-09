@@ -6,7 +6,7 @@
 
 1. [Market data parser](#1-market-data-parser)
 2. [Sequence check](#2-sequence-check)
-3. Order encoder (to do)
+3. [Order encoder](#3-order-encoder)
 4. Book (to do)
 
 How each module was written: the spec and tests were explained first, the logic predicted, then the code was pasted in by hand and the unit tests run.
@@ -160,3 +160,52 @@ output: valid = market_event_valid, item = {market data, the event, sequence_gap
 4. Why does a gap halt everything, and why permanently?
 5. What would go wrong if the registers updated on idle cycles too?
 6. Where does the halt actually happen, and why not here? *(In the quote manager: only it knows our orders' tokens; one place decides; the flag stays on the exact message.)*
+
+---
+
+## 3. Order encoder
+
+**File:** [rtl/order_encoder.sv](../rtl/order_encoder.sv) · **Tests:** 0/5 → **5/5 pass**, with no Verilator warnings under `-Wall` (2026-11-09).
+
+### What it does
+
+The parser in reverse. It takes one `order_request_t` from the quote manager and produces one whole order message on a 512-bit bus, registered (1 cycle later). Each field is written at its fixed byte offset, and every other byte is 0. The tests compare **all 64 bytes** against the simulator's own C++ encoding of the same order.
+
+### The layouts it writes
+
+| Message | Byte 0 | Fields | From |
+|---|---|---|---|
+| EnterOrder (25 bytes) | `'O'` | token @1 (8), side @9 (1), shares @10 (4), instrument @14 (2), price @16 (8), time in force @24 (1) | side: `is_buy ? 'B' : 'S'`; instrument = 1 and time in force = `'D'` are constants |
+| ReplaceOrder (29 bytes) | `'U'` | existing token @1 (8), replacement token @9 (8), shares @17 (4), price @21 (8) | byte 1 ← `existing_token`; byte 9 ← `token` |
+| CancelOrder (13 bytes) | `'X'` | token @1 (8), shares remaining @9 (4) | shares = 0 cancels the whole order |
+
+Writing a field is the mirror of reading one: `order_data_next[8*o +: 8*n] = value`.
+
+### Decision cards
+
+**Zero the whole message first, then write one kind's fields**
+- *What:* `order_data_next = '0` before the `case`.
+- *Why:* bytes past the end of the message must be 0 (the receiving C++ reads the length from the type byte, and the test checks all 64 bytes). Every bit is also assigned on every path, so no latch.
+
+**The request's `token` is the *replacement* in a ReplaceOrder**
+- *What:* byte 1 gets `existing_token`, byte 9 gets `token`.
+- *Why:* the wire format puts the order being replaced first. The request reuses one `token` field for "the order this message is about", which for a replace is the new one.
+- *Trap:* swapping the two would replace the wrong order. The test's two tokens differ in every byte, so a swap fails immediately.
+
+**Constants where the request has no field**
+- *What:* the type byte, instrument (1) and time in force (`'D'`) come from `messages_pkg.sv`.
+- *Why:* there's only one instrument (`sim::kInstrument`), and our quotes always rest on the book, so they are always Day orders, never IOC.
+
+**Unknown kind gives no message**
+- *What:* valid starts from `request_valid`; `default:` clears it.
+- *Why:* the 2-bit `kind` field can hold 3, which has no meaning. Sending garbage to an exchange is worse than sending nothing. `Fpga::Unload` would also throw on an unknown type byte ([app/fpga.cpp:46-47](../app/fpga.cpp#L46-L47)).
+
+**Speed:** each output byte is chosen from at most three inputs, which is the only logic. This should be one of the fastest modules.
+
+### Likely questions
+
+1. What's at byte 9 of a ReplaceOrder, and why not the existing token?
+2. Which fields don't come from the request? Why?
+3. What does a cancel with shares = 0 mean, and why does halting use it? *(Reduce the order to 0 shares, i.e. cancel it entirely. The quote manager's cancel-all builds exactly this.)*
+4. Why must the bytes after the message be zero?
+5. What happens if the quote manager sends kind = 3?
