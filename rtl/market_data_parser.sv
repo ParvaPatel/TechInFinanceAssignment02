@@ -24,8 +24,15 @@ module market_data_parser
     output market_data_event_t      market_event
 );
 
+    wire [7:0] message_type = in_data[7:0];
+
     logic               market_event_valid_next;
     market_data_event_t market_event_next;
+
+    // A field n bytes long at byte offset o is in_data[8*o +: 8*n]
+    // (design doc, Appendix B). Every message starts with a 19-byte header:
+    // type 0, instrument 1, sequence 3, timestamp 11; the order ref follows
+    // at 19. Fields a type doesn't carry stay zero.
 
     always_comb begin
         // TODO: decode in_data into market_event_next, based on its message
@@ -42,8 +49,39 @@ module market_data_parser
         //  - market_event_valid_next should be high exactly when in_valid is
         //    high and the type is known (the event is registered, so
         //    market_event_valid becomes high one cycle later).
-        market_event_valid_next = 1'b0;
+        market_event_valid_next = in_valid;
         market_event_next       = '0;
+        market_event_next.sequence_number = in_data[8*3 +: 64];   // sequence, bytes 3-10
+        market_event_next.order_ref       = in_data[8*19 +: 64];  // order ref, bytes 19-26
+
+        case (message_type)
+            TYPE_ADD: begin
+                market_event_next.kind   = MARKET_DATA_ADD;
+                market_event_next.is_buy = in_data[8*27 +: 8] == SIDE_BUY;  // side, byte 27
+                market_event_next.shares = in_data[8*28 +: 32];             // shares, bytes 28-31
+                market_event_next.price  = in_data[8*32 +: 64];             // price, bytes 32-39
+            end
+            TYPE_EXECUTED: begin
+                market_event_next.kind   = MARKET_DATA_EXECUTED;
+                market_event_next.shares = in_data[8*27 +: 32];  // executed shares, bytes 27-30
+            end
+            TYPE_CANCEL: begin
+                market_event_next.kind   = MARKET_DATA_CANCEL;
+                market_event_next.shares = in_data[8*27 +: 32];  // canceled shares, bytes 27-30
+            end
+            TYPE_DELETE: begin
+                market_event_next.kind = MARKET_DATA_DELETE;
+            end
+            TYPE_REPLACE: begin
+                market_event_next.kind          = MARKET_DATA_REPLACE;
+                market_event_next.new_order_ref = in_data[8*27 +: 64];  // new order ref, bytes 27-34
+                market_event_next.shares        = in_data[8*35 +: 32];  // shares, bytes 35-38
+                market_event_next.price         = in_data[8*39 +: 64];  // price, bytes 39-46
+            end
+            default: begin
+                market_event_valid_next = 1'b0;  // unknown type: ignored
+            end
+        endcase
     end
 
     always_ff @(posedge clk) begin

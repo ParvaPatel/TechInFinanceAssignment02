@@ -18,7 +18,7 @@
 | | Result |
 |---|---|
 | Toolchain | Verilator 5.053, Yosys 0.70, nextpnr-ecp5 0.11.1 (OSS CAD Suite 2026-10-14), 1.9 GB in `tools/` |
-| Problem 1 | The original folder path had spaces, which broke Verilator and the Makefile. **Fix:** the project moved to `/Users/parva/NYU/SEM3/Finance/assignment02`, with a link left at the old location |
+| Problem 1 | The original folder path had spaces, which broke Verilator and the Makefile. **Fix:** the project now lives at `/Users/Shared/d/NYU/SEM3/Finance/assignment02`, a path with no spaces |
 | Problem 2 | The same linker error as Assignment 1. **Fix:** `export SDKROOT=…/MacOSX.sdk`, then `make clean` once |
 | Build | `make` works: about 12 s, no warnings |
 | Unit tests | 4 of 33 pass. All 4 pass for trivial reasons (section 5) |
@@ -32,7 +32,7 @@ Neither fix changes any project file. Both problems exist only on this Mac; the 
 ## 2. How to build (every new terminal window)
 
 ```sh
-cd /Users/parva/NYU/SEM3/Finance/assignment02
+cd /Users/Shared/d/NYU/SEM3/Finance/assignment02
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
 make
 make test-holes
@@ -44,8 +44,6 @@ The `export` lasts only for the window it's typed in. To make it permanent, run 
 ```sh
 echo 'export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk' >> ~/.zshrc
 ```
-
-The old location (`/Users/Shared/Files From d.localized/NYU/SEM3/Finance/assignment02`) is now a link to the new one. Opening the project from either path works.
 
 ---
 
@@ -85,6 +83,8 @@ Same rule as Assignment 1: the problem exists only on this Mac, so the fix belon
 
 ### The fix
 
+**Update (2026-11-05):** the parent folder was renamed to `/Users/Shared/d`, which has no spaces. The project moved there and the link below was removed. The rest of this section records what was done at the time.
+
 1. **Moved** `assignment02` to `/Users/parva/NYU/SEM3/Finance/assignment02`. Same disk, so the move was a rename: instant, and git and GitHub are unaffected.
 2. **Left a link** (symlink) at the old location, pointing to the new folder.
 
@@ -109,7 +109,7 @@ The first build after the move compiled everything, including Verilator's strict
 clang++: error: linker command failed with exit code 1
 ```
 
-**Cause:** the same as in Assignment 1. A leftover macOS 27.0 SDK is newer than the installed linker. See [Assignment 1, notes/02](../../assignment01/notes/02-build-setup.md) (at `/Users/Shared/Files From d.localized/NYU/SEM3/Finance/assignment01/notes/`).
+**Cause:** the same as in Assignment 1. A leftover macOS 27.0 SDK is newer than the installed linker. See [Assignment 1, notes/02](../../assignment01/notes/02-build-setup.md) (at `/Users/Shared/d/NYU/SEM3/Finance/assignment01/notes/`).
 
 **Fix:**
 1. `export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`;
