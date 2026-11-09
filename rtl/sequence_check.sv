@@ -38,6 +38,10 @@ module sequence_check
     logic           item_valid_next;
     pipeline_item_t item_next;
 
+    // The sequence state, kept between messages.
+    logic [63:0]    expected_sequence, expected_sequence_next;  // the number the next message should carry
+    logic           gap_seen, gap_seen_next;                    // a gap at or before the last message (sticky)
+
     always_comb begin
         // TODO: each cycle,
         //  1. Compare this message's sequence number against the number you
@@ -50,15 +54,39 @@ module sequence_check
         //     high (this stage registers every event, valid or not).
         //  5. Build item_next: source = SOURCE_MARKET_DATA, market_event =
         //     market_event, and errors.sequence_gap set from step 2.
-        item_valid_next = 1'b0;
-        item_next       = '0;
+        
+        logic gap;  // a gap at or before this message
+
+        // A gap opens on this message if its number isn't the expected one;
+        // once seen, it stays seen.
+        gap = gap_seen
+           || (market_event_valid && market_event.sequence_number != expected_sequence);
+
+        // After each message, follow the feed: expect its number plus one.
+        // Idle cycles change nothing.
+        expected_sequence_next = expected_sequence;
+        gap_seen_next          = gap_seen;
+        if (market_event_valid) begin
+            expected_sequence_next = market_event.sequence_number + 64'd1;
+            gap_seen_next          = gap;
+        end
+
+        item_valid_next               = market_event_valid;
+        item_next                     = '0;
+        item_next.source              = SOURCE_MARKET_DATA;
+        item_next.market_event        = market_event;
+        item_next.errors.sequence_gap = gap;
     end
 
     always_ff @(posedge clk) begin
         if (rst) begin
             item_valid <= 1'b0;
+            expected_sequence <= 64'd1;  // the feed starts at 1
+            gap_seen          <= 1'b0;
         end else begin
             item_valid <= item_valid_next;
+            expected_sequence <= expected_sequence_next;
+            gap_seen          <= gap_seen_next;
         end
         // No reset: the item only matters when item_valid is high. Register
         // your own internal state here too, following the same style (an
